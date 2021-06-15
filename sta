@@ -1,0 +1,331 @@
+#!/bin/sh
+#
+# This script implements Richard Bejtlich's methodology for structured
+# traffic analysis (STA) to guide investigation of network packet captures.
+#
+# http://taosecurity.blogspot.com/2005/10/new-insecure-magazine-features.html
+#
+# Requirements:
+# - Argus (flow processing)
+# - Suricata (NIDS analysis)
+# - Tcpflow (TCP stream reassembly and flow output)
+
+# Set this to the hash command you wish to use.
+#  - md5, sha1, rmd160 or sha256 on BSD.
+#  - md5sum, sha1sum or sha256sum on GNU/Linux.
+#  - md5, shasum or shasum -a <algo> on macOS.
+#  - manyhash, a custom function as defined below.
+# manyhash is useful when you want to run several hash commands at once.
+HASHCMD="manyhash"
+
+# Set this to the absolute path to suricata.yaml you wish to use.
+SURICONF="/usr/local/etc/suricata/suricata.yaml"
+
+# Base initialization. This may be modified to add any options but note
+# several arguments may be passed using options to this script.
+SURI_EXTRA_ARGS=""
+
+# Default flow status reporting interval.
+ARGUS_REPORT_INT=3600
+
+# Hashes a file using multiple methods. You can redefine this to use
+# different hash utilities if you like.
+#
+manyhash() {
+    (
+      printf "%s %s\n" MD5 "$(md5 -r $* | awk '{print $1}')"
+      printf "%s %s\n" SHA1 "$(shasum -a1 $* | awk '{print $1}')"
+      printf "%s %s\n" SHA256 "$(shasum -a256 $* | awk '{print $1}')"
+    ) | column -t 
+} 
+
+# Run PCAP NIDS analysis. By default set up to run Suricata against input file.
+# Arguments:
+#   1: PCAP file
+#
+run_nids_analysis()
+{
+    local _CAPFILE="$1"
+
+    # Set Suricata log directory in same path as PCAP
+    suricatalogdir="${CAPPATH}.suricata.d"
+    mkdir -p "$suricatalogdir"
+
+    # Configure HOME_NET variable
+    if [ -n "$HOMENET" ]; then
+        SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set vars.address-groups.HOME_NET=${HOMENET}"
+    fi
+
+    # Configure Suricata runtime log
+    [ -n "$ENABLE_SURI_CONSOLE_LOG" ] && cons_arg="yes" || cons_arg="no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set logging.outputs.0.console.enabled=${cons_arg}"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set logging.outputs.1.file.filename=${suricatalogdir}/suricata.log"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set logging.outputs.1.file.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set logging.outputs.2.syslog.enabled=no"
+    # Configure Suricata data outputs
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.0.fast.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.0.fast.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.1.eve-log.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.1.eve-log.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.2.unified2-alert.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.3.http-log.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.3.http-log.filename=http.log"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.3.http-log.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.4.tls-log.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.4.tls-log.filename=tls.log"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.4.tls-log.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.5.tls-store.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.5.tls-store.certs-log-dir=certs"
+    #SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.5.tls-store.force-hash=[md5,sha1,sha256]"
+    #SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.5.tls-store.force-hash=[md5]"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.6.dns-log.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.6.dns-log.filename=dns.log"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.6.dns-log.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.7.pcap-log.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.8.alert-debug.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.9.alert-prelude.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.10.stats.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.11.syslog.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.12.drop.enabled=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.log-dir=files"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.stream-depth=0"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.force-magic=yes"
+    #SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.force-hash=[md5,sha1,sha256]"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.force-hash=[md5]"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.13.file-store.force-filestore=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.14.file-log.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.14.file-log.filename=files-json.log"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.14.file-log.force-magic=yes"
+    #SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.14.file-log.force-hash=[md5,sha1,sha256]"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.14.file-log.force-hash=[md5]"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.14.file-log.append=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.15.tcp-data.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.15.tcp-data.type=dir"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.16.http-body-data.enabled=yes"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set outputs.16.http-body-data.type=dir"
+    # Adjust additional engine settings.
+    #  stream reassembly depth: unlimited for max file extraction
+    #  libhtp req/resp body limits: unlimited for max detection
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set stream.inline=no"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set stream.reassembly.depth=0"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set libhtp.default-config.request-body-limit=0"
+    SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} --set libhtp.default-config.response-body-limit=0"
+
+    printf "%s " " [*] suricata..."
+    suri_cmd="suricata -c ${SURICONF} -l $suricatalogdir $SURI_EXTRA_ARGS"
+    ${suri_cmd} --dump-config > "${suricatalogdir}/config_dump"
+    suri_cmd="${suri_cmd} -r ${_CAPFILE}"
+    # Normalize and record command line
+    echo "${suri_cmd}" | tr -s " " > "${suricatalogdir}/cmdline"
+    # Run analysis against PCAP
+    ${suri_cmd}
+    printf "(%d alerts)\n" "$(wc -l < "${suricatalogdir}/fast.log" | tr -d " ")"
+
+    # Suricata alerts summary
+    printf "%s " " [*] alert summary..."
+    egrep -o '\[\*\*\].*\[\*\*\]' "${suricatalogdir}/fast.log" \
+        | sed -e 's![[:space:]]*\[\*\*\][[:space:]]*!!' \
+        | sort | uniq -c | sort -rn > "${suricatalogdir}/alert.summary"
+    printf "(%d unique alerts)\n" \
+        "$(wc -l < "${suricatalogdir}/alert.summary" | tr -d " ")"
+
+    rm -f "${RULETMP}"
+}
+
+# Output source IPs sending TCP SYN packets to help establish possible
+# value(s) for the HOME_NET option.
+# Arguments
+#   1: PCAP file
+#
+output_syn_clients()
+{
+    local _pcap="$1"
+    SRCS=$(tcpdump -nqr "${_pcap}" 'ip and tcp[13] == 0x02' \
+        | awk '{print $3}' |cut -d. -f1-4 | sort |uniq -c |sort -rn)
+
+    # Return response based on line count from the tcpdump. No lines means no
+    # clients (should be manually handled), one line means one SYN sender and
+    # best guess for the HOME_NET value, >1 lines means multiple possibilities
+    # and it should be returned as is with counts. The caller should use the
+    # output directly if it matches IPv4 format, or handle any other case
+    # appropriately.
+    _cnt=$(printf "%s" "${SRCS}" | grep -c '^')
+    case $_cnt in
+      0) err "Unable to guess HOME_NET clients (no SYN senders), please manually specify"
+         exit 1
+         ;;
+      1) echo "${SRCS}" | awk '{print $2}'
+         ;;
+      *) echo "${SRCS}"
+         ;;
+    esac
+}
+
+# Determine if input is an IPv4 address
+# Arguments
+#   1: address string
+is_ipv4()
+{
+    local _s="$1"
+    IPV4='^([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}(/[0-9]{1,2})?$'
+    echo "${_s}" | egrep "${IPV4}" >/dev/null || return 1
+
+    local IFS=.
+    set -- $1
+    for octet in $*; do
+        [ ${octet%/*} -le 255 ] || return 1
+    done
+}
+
+# Output error message
+# Arguments
+#   1: Error text
+#
+err()
+{
+    [ -n "$1" ] || return
+    echo "[!] $1" >&2
+}
+
+# Show help output
+#
+show_usage()
+{
+    cat <<-EOF
+	Extract analysis data from one or more PCAP input files.
+
+	USAGE: $(basename $0) [options] file [...]
+	  -H: set the HOME_NET variable for suricata (this is
+	      typically important)
+	  -i: set Argus flow reporting interval (seconds;
+	      default is ${ARGUS_REPORT_INT})
+	  -c: show Suricata console log output
+	  -g: guess address(es) for Suricata HOME_NET variable (to feed to -H option;
+	      this works by outputting IPs seen sending TCP SYN packets and ranks
+	      them by packet count)
+	  -v: enable Suricata verbose output
+EOF
+}
+
+# Parse script arguments
+while getopts "H:i:cgvh" optchar; do
+    case $optchar in
+        H)  HOMENET="$OPTARG"                        ;;
+        i)  ARGUS_REPORT_INT="$OPTARG"               ;;
+        c)  ENABLE_SURI_CONSOLE_LOG=1                ;;
+        g)  GUESS_HOME_NET=1                         ;;
+        v)  SURI_EXTRA_ARGS="${SURI_EXTRA_ARGS} -v"  ;;
+        h)  show_usage; exit 0                       ;;
+    esac
+done
+shift $(($OPTIND - 1))
+
+# Process arguments
+[ $# -ge 1 ] || { show_usage; exit 1; }
+
+for CAPFILE in $*; do
+    if [ ! -r "$CAPFILE" ]; then
+        echo "ERROR: cannot read capture file $CAPFILE" >&2
+        continue
+    fi
+    CAPDIR="$(dirname $CAPFILE)"
+    if [ X"$CAPDIR" = X. ]; then
+        CAPDIR="$PWD"
+    fi
+    # Trim the extension off of the file for the name of the capture.
+    # We put output files in the same directory path as the capture, and
+    # we prefix those files with the same prefix/name the capture file has.
+    CAPPATH="${CAPFILE%.*}"
+
+    echo "[Capture: $CAPFILE]"
+
+    # If asked to guess HOME_NET IPs, dump them and abort further analysis.
+    # If the user supplied HOME_NET and asks to guess, defer to given value.
+    if [ -z "${HOMENET}" ]; then
+        if [ -n "$GUESS_HOME_NET" ]; then
+            GUESS=$(output_syn_clients "${CAPFILE}")
+            if is_ipv4 "${GUESS}"; then
+                echo " [i] guessing ${GUESS} for HOME_NET address..."
+                HOMENET="${GUESS}"
+            else
+                echo "${GUESS}"
+                continue
+            fi
+        else
+            echo " [w] not specifying value for HOME_NET address, this may affect analysis..."
+        fi
+    else
+        echo " [i] using ${HOMENET} for HOME_NET address..."
+    fi
+
+    echo "=> [Metadata]"
+
+    # Crypto hashes
+    echo " [*] recording hashes..."
+    $HASHCMD "$CAPFILE" > "${CAPPATH}.hashes"
+
+    # Capinfos
+    echo " [*] capinfos..."
+    capinfos "$CAPFILE" > "${CAPPATH}.capinfos"
+
+    echo "=> [Flow data]"
+
+    # Argus
+    echo " [*] building flows (argus)..."
+    argus -r "$CAPFILE" -w "${CAPPATH}.argus" -S "$ARGUS_REPORT_INT"
+
+    # Racount
+    echo " [*] racount..."
+    racount -r "${CAPPATH}.argus" -M proto addr > "${CAPPATH}.racount"
+
+    # Rahosts
+    echo " [*] rahosts..."
+    rahosts -nr "${CAPPATH}.argus" > "${CAPPATH}.rahosts"
+
+    # Ra summary
+    echo " [*] ra (flow summary)..."
+    ra -n -r "${CAPPATH}.argus" -s saddr daddr dport proto \
+        | sort -n -t . -k 1,1 -k 2,2 -k 3,3 -k 4,4 | uniq -c > \
+        "${CAPPATH}.rasummary"
+
+    # Ra summary (sorted)
+    echo " [*] ra (host flow summary, sorted)..."
+    (head -n 1 "${CAPPATH}.rasummary" && tail -n +2 "${CAPPATH}.rasummary" | sort -rn) \
+        > "${CAPPATH}.rasummary.sorted"
+
+    # Ra full
+    echo " [*] ra (full flows)..."
+    ra -n -L 0 -A -Z b -s +10dur -r "${CAPPATH}.argus" > \
+        "${CAPPATH}.rafull"
+
+    # Tcpflow
+    echo " [*] tcpflow..."
+    tcpflow -c -r "$CAPFILE" -S enable_report=NO > "${CAPPATH}.tcpflow"
+
+    # Host lists and count
+    echo " [*] dst hosts..."
+    tcpdump -tqnr "$CAPFILE" 'ip' 2>/dev/null | awk '{print $4}' | cut -d'.' -f1-4 \
+        | sort -u -t. -k1,1 -k2,2 -k3,3 -k4,4 > "${CAPPATH}.dsthosts.sorted"
+    tcpdump -tqnr "$CAPFILE" 'ip' 2>/dev/null | awk '{print $4}' | cut -d'.' -f1-4 \
+        | sort | uniq -c | sort -rn > "${CAPPATH}.dsthosts.sorted.count"
+
+    # Port lists and count
+    echo " [*] dst ports..."
+    tcpdump -tqnr "$CAPFILE" 'ip' 2>/dev/null | tr -d ':' \
+        | awk '$4 ~ /^([0-9]{1,3}\.){4}[0-9]{1,5}$/ {print $4}' \
+        | cut -d'.' -f5 | sort -un \
+        > "${CAPPATH}.dstports.sorted"
+    tcpdump -tqnr "$CAPFILE" 'ip' 2>/dev/null | tr -d ':' \
+        | awk '$4 ~ /^([0-9]{1,3}\.){4}[0-9]{1,5}$/ {print $4}' \
+        | cut -d'.' -f5 | sort | uniq -c | sort -rn \
+        > "${CAPPATH}.dstports.sorted.count"
+
+    echo "=> [IDS]"
+
+    # Suricata signatures match
+    run_nids_analysis "${CAPFILE}"
+
+    echo "Done! Output files in $CAPDIR"
+    echo
+done
